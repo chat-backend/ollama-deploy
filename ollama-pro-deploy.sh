@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ########################################
-# PRO+ Ollama Deploy Script (Version 10)
+# PRO+ Ollama Deploy Script (Version 14)
 # - Multi-domain
 # - Auto-update mode
 # - Auto SSL renew
@@ -13,9 +13,9 @@
 # - Hot-swap node (add/remove backend at runtime)
 # - Live draining (ngừng nhận request mới, giữ kết nối đang chạy)
 # - Rolling restart từng node (zero-downtime)
-# - Auto-drain khi node load cao (CPU)
-# - Hooks scale-out / scale-in (tùy hạ tầng)
-# - Tuned Ollama runtime (temperature, top_p, top_k, num_predict, stream)
+# - Auto-drain khi node load cao (CPU) — V12
+# - Auto-scale hooks (scale-out / scale-in) — V13
+# - Auto-heal backend (drain + restart local) — V14
 ########################################
 
 DOMAINS=("api.aiallplatform.com")
@@ -35,7 +35,7 @@ UPSTREAM_FILE="/etc/nginx/conf.d/ollama-upstream.conf"
 HEALTH_SCRIPT="/usr/local/bin/ollama-cluster-health.sh"
 AUTO_DRAIN_SCRIPT="/usr/local/bin/ollama-auto-drain.sh"
 
-CPU_THRESHOLD=85   # % CPU để auto-drain
+CPU_THRESHOLD=85
 SCALE_OUT_THRESHOLD=90
 SCALE_IN_THRESHOLD=30
 
@@ -102,7 +102,6 @@ EOF
     log "Using existing project config at $PROJECT_CONFIG_FILE"
   fi
 
-  # shellcheck disable=SC1090
   . "$PROJECT_CONFIG_FILE"
 
   echo "OLLAMA_API_KEY=$API_KEY" >"$API_KEY_FILE"
@@ -255,11 +254,11 @@ rolling_restart() {
 }
 
 ########################################
-# Auto-drain & scale hooks
+# Auto-drain & scale hooks (V12 + V13)
 ########################################
 
 setup_auto_drain_script() {
-  log "Setting up auto-drain script (V12)..."
+  log "Setting up auto-drain + auto-scale script (V15)..."
 
   cat <<'EOF' >"/usr/local/bin/ollama-auto-drain.sh"
 #!/bin/bash
@@ -267,12 +266,17 @@ setup_auto_drain_script() {
 LOG_FILE="/var/log/ollama-auto-drain.log"
 BACKENDS_CONFIG="/etc/ollama/backends.conf"
 DRAIN_CONFIG="/etc/ollama/backends.drain"
-CPU_DRAIN_THRESHOLD=85
-CPU_UNDRAIN_THRESHOLD=60
 STATE_DIR="/var/lib/ollama-auto-drain"
 SCRIPT_PATH="/usr/local/bin/ollama-pro-deploy.sh"
 
-mkdir -p "$STATE_DIR"
+CPU_DRAIN_THRESHOLD=85
+CPU_UNDRAIN_THRESHOLD=60
+
+CPU_SCALE_OUT_THRESHOLD=90
+CPU_SCALE_IN_THRESHOLD=30
+
+SCALE_STATE_DIR="/var/lib/ollama-auto-scale"
+mkdir -p "$STATE_DIR" "$SCALE_STATE_DIR"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -303,21 +307,22 @@ for BE in "${BACKENDS[@]}"; do
   METRICS_URL="http://$HOST:9100/metrics"
   HEALTH_URL="http://$BE/api/health"
   STATE_FILE="$STATE_DIR/cpu_$HOST.state"
+  SCALE_FILE="$SCALE_STATE_DIR/scale_$HOST.state"
 
-  # Nếu chỉ có 1 backend → không bao giờ drain
+  # Nếu chỉ có 1 backend → không drain, không scale-in
   if [ ${#BACKENDS[@]} -eq 1 ]; then
-    log "Single-backend mode → skipping drain logic"
+    log "Single-backend mode → skipping drain/scale logic"
     exit 0
   fi
 
-  # Kiểm tra backend sống hay chết
+  # Backend chết → drain
   if ! curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null; then
     log "Backend $BE is UNHEALTHY → draining"
     $SCRIPT_PATH --drain-backend "$BE"
     continue
   fi
 
-  # Kiểm tra Node Exporter
+  # Node Exporter chết → drain
   if ! curl -fsS --max-time 2 "$METRICS_URL" >/dev/null; then
     log "Node Exporter unreachable for $BE → draining"
     $SCRIPT_PATH --drain-backend "$BE"
@@ -331,7 +336,6 @@ for BE in "${BACKENDS[@]}"; do
       /node_cpu_seconds_total{.*mode!="idle"/ { busy += $3 }
       END { print idle" "busy }
     ')
-
 
   CURRENT_IDLE=$(echo "$CURRENT_SNAPSHOT" | awk '{print $1}')
   CURRENT_BUSY=$(echo "$CURRENT_SNAPSHOT" | awk '{print $2}')
@@ -362,31 +366,63 @@ for BE in "${BACKENDS[@]}"; do
   CPU_PERCENT=$(awk -v busy="$DELTA_BUSY" -v total="$DELTA_TOTAL" \
     'BEGIN {printf "%.0f", (busy/total)*100}')
 
-  log "Backend $BE CPU≈${CPU_PERCENT}% (delta-based)"
+  log "Backend $BE CPU≈${CPU_PERCENT}%"
 
   echo "$CURRENT_IDLE $CURRENT_BUSY" >"$STATE_FILE"
 
-  # Drain logic
+  ########################################
+  # V12: Auto-drain logic
+  ########################################
+
   if [ "$CPU_PERCENT" -ge "$CPU_DRAIN_THRESHOLD" ]; then
     if ! is_draining "$BE"; then
       log "High load → draining $BE"
       $SCRIPT_PATH --drain-backend "$BE"
-    else
-      log "$BE already draining"
     fi
-    continue
-  fi
-
-  # Undrain logic
-  if [ "$CPU_PERCENT" -le "$CPU_UNDRAIN_THRESHOLD" ]; then
+  elif [ "$CPU_PERCENT" -le "$CPU_UNDRAIN_THRESHOLD" ]; then
     if is_draining "$BE"; then
       log "CPU normal → undraining $BE"
       $SCRIPT_PATH --undrain-backend "$BE"
     fi
+  fi
+
+  ########################################
+  # V15: Auto-scale logic
+  ########################################
+
+  SCALE_COUNT=0
+  if [ -f "$SCALE_FILE" ]; then
+    SCALE_COUNT=$(cat "$SCALE_FILE")
+  fi
+
+  # CPU cao → scale-out
+  if [ "$CPU_PERCENT" -ge "$CPU_SCALE_OUT_THRESHOLD" ]; then
+    SCALE_COUNT=$((SCALE_COUNT + 1))
+    echo "$SCALE_COUNT" >"$SCALE_FILE"
+
+    if [ "$SCALE_COUNT" -ge 3 ]; then
+      log "Auto-scale V15: CPU high → scale-out triggered"
+      $SCRIPT_PATH --add-backend "127.0.0.1:11435"
+      echo 0 >"$SCALE_FILE"
+    fi
     continue
   fi
 
-  log "$BE in mid-range CPU → no change"
+  # CPU thấp → scale-in
+  if [ "$CPU_PERCENT" -le "$CPU_SCALE_IN_THRESHOLD" ]; then
+    SCALE_COUNT=$((SCALE_COUNT + 1))
+    echo "$SCALE_COUNT" >"$SCALE_FILE"
+
+    if [ "$SCALE_COUNT" -ge 3 ]; then
+      log "Auto-scale V15: CPU low → scale-in triggered"
+      $SCRIPT_PATH --remove-backend "127.0.0.1:11435"
+      echo 0 >"$SCALE_FILE"
+    fi
+    continue
+  fi
+
+  # CPU trung bình → reset counter
+  echo 0 >"$SCALE_FILE"
 done
 EOF
 
@@ -516,13 +552,11 @@ issue_ssl_for_domain() {
   local DOMAIN="$1"
   log "Requesting SSL certificate for $DOMAIN..."
 
-  # FIX: Không chạy certbot nếu cert đã tồn tại
   if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
     log "SSL for $DOMAIN already exists → skipping certbot."
     return
   fi
 
-  # Tắt nginx để standalone certbot chạy
   if systemctl is-active --quiet nginx; then
     log "Stopping nginx temporarily for standalone Certbot..."
     run "systemctl stop nginx"
@@ -677,7 +711,7 @@ reload_nginx() {
 }
 
 ########################################
-# Cluster health-check & dynamic upstream
+# Cluster health-check & dynamic upstream (V14 auto-heal)
 ########################################
 
 setup_cluster_health_script() {
@@ -690,6 +724,10 @@ LOG_FILE="/var/log/ollama-cluster-health.log"
 BACKENDS_CONFIG="/etc/ollama/backends.conf"
 DRAIN_CONFIG="/etc/ollama/backends.drain"
 UPSTREAM_FILE="/etc/nginx/conf.d/ollama-upstream.conf"
+
+HEAL_STATE_DIR="/var/lib/ollama-auto-heal"
+mkdir -p "$HEAL_STATE_DIR"
+MAX_FAILS_BEFORE_HEAL=3
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -715,6 +753,56 @@ is_draining() {
   return 1
 }
 
+heal_backend() {
+  local BE="$1"
+  local HOST="${BE%%:*}"
+  local PORT="${BE##*:}"
+  local STATE_FILE="$HEAL_STATE_DIR/heal_${HOST}_${PORT}.state"
+
+  local FAIL_COUNT=0
+  if [ -f "$STATE_FILE" ]; then
+    FAIL_COUNT=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+  fi
+
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  echo "$FAIL_COUNT" >"$STATE_FILE"
+
+  log "Auto-heal V14: $BE unhealthy (fail count=$FAIL_COUNT)."
+
+  if [ "$FAIL_COUNT" -lt "$MAX_FAILS_BEFORE_HEAL" ]; then
+    log "Auto-heal V14: not healing yet (need $MAX_FAILS_BEFORE_HEAL consecutive fails)."
+    return
+  fi
+
+  log "Auto-heal V14: starting heal sequence for $BE."
+
+  if [ -f "$DRAIN_CONFIG" ] && ! grep -qx "$BE" "$DRAIN_CONFIG"; then
+    echo "$BE" >>"$DRAIN_CONFIG"
+    log "Auto-heal V14: $BE marked as draining."
+  fi
+
+  if [ "$HOST" = "127.0.0.1" ] || [ "$HOST" = "localhost" ]; then
+    log "Auto-heal V14: restarting local ollama service for $BE..."
+    systemctl restart ollama || log "Auto-heal V14: failed to restart ollama for $BE"
+    sleep 5
+
+    if curl -fsS --max-time 5 "http://$BE/api/health" >/dev/null 2>&1; then
+      log "Auto-heal V14: $BE recovered after restart. Removing from draining."
+      if [ -f "$DRAIN_CONFIG" ]; then
+        grep -vx "$BE" "$DRAIN_CONFIG" >"${DRAIN_CONFIG}.tmp" || true
+        mv "${DRAIN_CONFIG}.tmp" "$DRAIN_CONFIG"
+      fi
+      echo 0 >"$STATE_FILE"
+      return
+    else
+      log "Auto-heal V14: $BE still unhealthy after restart. Keeping it draining."
+      return
+    fi
+  else
+    log "Auto-heal V14: $BE is remote node → please heal manually (SSH / orchestrator)."
+  fi
+}
+
 HEALTHY_BACKENDS=()
 
 for BE in "${BACKENDS[@]}"; do
@@ -727,8 +815,12 @@ for BE in "${BACKENDS[@]}"; do
   if curl -fsS --max-time 3 "$URL" >/dev/null; then
     log "Backend healthy: $BE"
     HEALTHY_BACKENDS+=("$BE")
+
+    STATE_FILE="$HEAL_STATE_DIR/heal_${BE%%:*}_${BE##*:}.state"
+    echo 0 >"$STATE_FILE" 2>/dev/null || true
   else
     log "Backend UNHEALTHY: $BE"
+    heal_backend "$BE"
   fi
 done
 
@@ -828,7 +920,7 @@ setup_monitoring() {
   cd /tmp || exit 1
   curl -LO https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
   tar xvf node_exporter-1.7.0.linux-amd64.tar.gz
-  cp node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
+  cp node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/ || log "Node exporter already in use, skipping copy"
 
   cat <<EOF >/etc/systemd/system/node_exporter.service
 [Unit]
@@ -880,6 +972,67 @@ $SCRIPT_PATH --update
 EOF
 
   chmod +x /etc/cron.weekly/ollama-auto-update
+}
+
+########################################
+# V13: Auto-scale hooks
+########################################
+
+scale_out_hook() {
+  log "⚠ V13 scale-out hook triggered (cluster overloaded)."
+
+  if [ -f "$BACKENDS_CONFIG" ]; then
+    mapfile -t CUR_BACKENDS <"$BACKENDS_CONFIG"
+  else
+    CUR_BACKENDS=("${DEFAULT_BACKENDS[@]}")
+  fi
+
+  local MAX_BACKENDS=5
+  if [ "${#CUR_BACKENDS[@]}" -ge "$MAX_BACKENDS" ]; then
+    log "Scale-out skipped: already at max backends ($MAX_BACKENDS)."
+    return
+  fi
+
+  local NEW_BE="127.0.0.1:11435"
+
+  for BE in "${CUR_BACKENDS[@]}"; do
+    if [ "$BE" = "$NEW_BE" ]; then
+      log "Scale-out skipped: backend $NEW_BE already exists."
+      return
+    fi
+  done
+
+  log "Scale-out: adding new backend $NEW_BE (V13)."
+  add_backend "$NEW_BE"
+
+  if check_health_script; then
+    "$HEALTH_SCRIPT" 2>/dev/null || true
+  fi
+}
+
+scale_in_hook() {
+  log "ℹ V13 scale-in hook triggered (cluster underutilized)."
+
+  if [ -f "$BACKENDS_CONFIG" ]; then
+    mapfile -t CUR_BACKENDS <"$BACKENDS_CONFIG"
+  else
+    CUR_BACKENDS=("${DEFAULT_BACKENDS[@]}")
+  fi
+
+  if [ "${#CUR_BACKENDS[@]}" -le 1 ]; then
+    log "Scale-in skipped: only one backend left."
+    return
+  fi
+
+  local REMOVE_BE="${CUR_BACKENDS[-1]}"
+
+  log "Scale-in: removing backend $REMOVE_BE (V13)."
+  drain_backend "$REMOVE_BE"
+  remove_backend "$REMOVE_BE"
+
+  if check_health_script; then
+    "$HEALTH_SCRIPT" 2>/dev/null || true
+  fi
 }
 
 ########################################
@@ -952,7 +1105,7 @@ main() {
       ;;
   esac
 
-  log "🚀 Starting PRO+ Ollama deployment (V10) for domains: ${DOMAINS[*]}"
+  log "🚀 Starting PRO+ Ollama deployment (V14) for domains: ${DOMAINS[*]}"
 
   init_project_config
   load_backends
@@ -988,7 +1141,6 @@ main() {
   setup_cluster_health_cron
   setup_auto_drain_script
 
-  # shellcheck disable=SC1090
   . "$PROJECT_CONFIG_FILE"
 
   for DOMAIN in "${DOMAINS[@]}"; do
@@ -1005,8 +1157,8 @@ main() {
   log "    OLLAMA_URL_ONLINE=$BASE_LINK"
   log "    x-api-key: $API_KEY"
 
-  scale_out_hook
-  scale_in_hook
+  log "✔ Deployment completed (V14)."
+  log "ℹ Auto-scale hooks are available but NOT triggered automatically after deploy."
 }
 
 main "$@"
