@@ -442,7 +442,11 @@ auto_update_mode() {
 
   log "Reloading services: ollama, nginx, node_exporter, fail2ban..."
   systemctl reload ollama 2>/dev/null || systemctl restart ollama || true
-  nginx -t >/dev/null 2>&1 && nginx -s reload || true
+
+  if nginx -t >/dev/null 2>&1; then
+    nginx -s reload || log "WARN: nginx reload failed"
+  fi
+
   systemctl reload node_exporter 2>/dev/null || systemctl restart node_exporter || true
   systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban || true
 
@@ -510,8 +514,15 @@ install_certbot() {
 
 issue_ssl_for_domain() {
   local DOMAIN="$1"
-  log "Requesting SSL certificate (standalone) for $DOMAIN..."
+  log "Requesting SSL certificate for $DOMAIN..."
 
+  # FIX: Không chạy certbot nếu cert đã tồn tại
+  if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+    log "SSL for $DOMAIN already exists → skipping certbot."
+    return
+  fi
+
+  # Tắt nginx để standalone certbot chạy
   if systemctl is-active --quiet nginx; then
     log "Stopping nginx temporarily for standalone Certbot..."
     run "systemctl stop nginx"
@@ -579,7 +590,6 @@ configure_nginx_site_for_domain() {
 
   log "Creating/updating Nginx site for Ollama on $DOMAIN..."
 
-  # shellcheck disable=SC1090
   . "$PROJECT_CONFIG_FILE"
 
   cat <<EOF >"$SITE_FILE"
@@ -615,7 +625,6 @@ server {
         return 204;
     }
 
-    # Health check (no API key required, cluster-aware)
     location = /ollama/api/health {
         proxy_pass http://ollama_cluster/api/health;
         proxy_http_version 1.1;
@@ -630,7 +639,6 @@ server {
         proxy_buffering off;
     }
 
-    # All other API endpoints require API key + optional token
     location /ollama {
         if (\$http_x_api_key = "") {
             return 401;
@@ -659,8 +667,13 @@ EOF
 }
 
 reload_nginx() {
-  run "nginx -t"
-  run "nginx -s reload"
+  log "Testing Nginx config..."
+  if nginx -t; then
+    log "Reloading Nginx..."
+    nginx -s reload || log "WARN: nginx reload failed (but config is valid)"
+  else
+    log "ERROR: Nginx config invalid. Not reloading."
+  fi
 }
 
 ########################################
@@ -697,9 +710,7 @@ fi
 is_draining() {
   local BE="$1"
   for d in "${DRAIN_BACKENDS[@]}"; do
-    if [ "$d" = "$BE" ]; then
-      return 0
-    fi
+    if [ "$d" = "$BE" ]; then return 0; fi
   done
   return 1
 }
@@ -712,18 +723,17 @@ for BE in "${BACKENDS[@]}"; do
     continue
   fi
 
-  HOST_PORT="$BE"
-  URL="http://$HOST_PORT/api/health"
-  if curl -fsS --max-time 3 "$URL" >/dev/null 2>&1; then
-    log "Backend healthy: $HOST_PORT"
-    HEALTHY_BACKENDS+=("$HOST_PORT")
+  URL="http://$BE/api/health"
+  if curl -fsS --max-time 3 "$URL" >/dev/null; then
+    log "Backend healthy: $BE"
+    HEALTHY_BACKENDS+=("$BE")
   else
-    log "Backend UNHEALTHY: $HOST_PORT"
+    log "Backend UNHEALTHY: $BE"
   fi
 done
 
 if [ ${#HEALTHY_BACKENDS[@]} -eq 0 ]; then
-  log "No healthy backends found (excluding draining). Keeping previous upstream config."
+  log "No healthy backends found. Keeping previous upstream."
   exit 0
 fi
 
@@ -738,7 +748,11 @@ log "Updating upstream with healthy backends: ${HEALTHY_BACKENDS[*]}"
   echo "}"
 } >"$UPSTREAM_FILE"
 
-nginx -t >/dev/null 2>&1 && nginx -s reload
+if nginx -t >/dev/null 2>&1; then
+  nginx -s reload || log "WARN: nginx reload failed"
+else
+  log "ERROR: invalid nginx config"
+fi
 EOF
 
   chmod +x "$HEALTH_SCRIPT"
