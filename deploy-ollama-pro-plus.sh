@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ########################################
-# PRO+ Ollama Deploy Script (Full)
+# PRO+ Ollama Deploy Script (Full, Fixed)
 ########################################
 
 DOMAIN="api.aiallplatform.com"
@@ -104,6 +104,35 @@ EOF
 }
 
 ########################################
+# Certbot & SSL (standalone, không sửa Nginx)
+########################################
+
+install_certbot() {
+  if command -v certbot >/dev/null 2>&1; then
+    log "Certbot already installed."
+  else
+    log "Installing Certbot..."
+    run "apt install certbot -y"
+  fi
+}
+
+issue_ssl() {
+  log "Requesting SSL certificate (standalone, no nginx auto-edit)..."
+
+  # Tạm dừng nginx nếu đang chạy
+  if systemctl is-active --quiet nginx; then
+    log "Stopping nginx temporarily for standalone Certbot..."
+    run "systemctl stop nginx"
+  fi
+
+  run "certbot certonly --standalone -d $DOMAIN --non-interactive --agree-tos -m $EMAIL"
+
+  log "SSL certificate obtained for $DOMAIN."
+
+  # Không khởi động lại nginx ở đây, sẽ làm sau khi cấu hình xong
+}
+
+########################################
 # Nginx install & config
 ########################################
 
@@ -157,23 +186,27 @@ server {
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
 
-    # CORS
-    add_header Access-Control-Allow-Origin *;
-    add_header Access-Control-Allow-Methods "GET, POST, OPTIONS";
-    add_header Access-Control-Allow-Headers "Authorization, Content-Type, x-api-key";
+    # CORS (always để áp dụng cả khi 4xx)
+    add_header Access-Control-Allow-Origin * always;
+    add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Authorization, Content-Type, x-api-key" always;
 
+    # Preflight
     if (\$request_method = OPTIONS) {
         return 204;
     }
 
-    location /ollama/ {
-        proxy_pass http://127.0.0.1:11434/;
+    # Ollama reverse proxy (đơn giản, không redirect vòng)
+    location /ollama {
+        proxy_pass http://127.0.0.1:11434;
         proxy_http_version 1.1;
+
         proxy_set_header Connection "";
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+
         proxy_read_timeout 3600;
         proxy_send_timeout 3600;
         proxy_buffering off;
@@ -184,24 +217,6 @@ EOF
   run "ln -sf /etc/nginx/sites-available/ollama /etc/nginx/sites-enabled/ollama"
   run "nginx -t"
   run "systemctl restart nginx"
-}
-
-########################################
-# Certbot & SSL
-########################################
-
-install_certbot() {
-  if command -v certbot >/dev/null 2>&1; then
-    log "Certbot already installed."
-  else
-    log "Installing Certbot..."
-    run "apt install certbot python3-certbot-nginx -y"
-  fi
-}
-
-issue_ssl() {
-  log "Requesting SSL certificate..."
-  run "certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL --redirect"
 }
 
 ########################################
@@ -243,13 +258,15 @@ setup_api_key_protection() {
   mkdir -p /etc/ollama
 
   if [ ! -f "$API_KEY_FILE" ]; then
-    echo "OLLAMA_API_KEY=$(openssl rand -hex 32)" > "$API_KEY_FILE"
+    echo "OLLAMA_API_KEY=$(openssl rand -hex 64)" > "$API_KEY_FILE"
   fi
 
+  # shellcheck disable=SC1090
   source "$API_KEY_FILE"
   log "API Key: $OLLAMA_API_KEY"
 
-  sed -i '/location \/ollama\//a \
+  # Chèn check API key vào location /ollama (đã đồng bộ với config)
+  sed -i '/location \/ollama {/a \
         if ($http_x_api_key != "'"$OLLAMA_API_KEY"'") { return 401; }' \
         /etc/nginx/sites-available/ollama
 
@@ -345,12 +362,12 @@ main() {
   install_ollama
   configure_ollama_service
 
+  install_certbot
+  issue_ssl
+
   install_nginx
   harden_nginx_global
   configure_nginx_site
-
-  install_certbot
-  issue_ssl
 
   setup_autoload_model
   setup_api_key_protection
