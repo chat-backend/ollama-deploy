@@ -11,11 +11,11 @@
 # - Zero-downtime: only nginx reload (no restart)
 # - Project config: API_KEY + TOKEN_SECRET + BASE_LINK (config v0.7)
 # - Hot-swap node (add/remove backend at runtime)
-# - Live draining (ngừng nhận request mới, giữ kết nối đang chạy)
-# - Rolling restart từng node (zero-downtime)
-# - Auto-drain khi node load cao (CPU)
-# - Hooks scale-out / scale-in (tùy hạ tầng)
-# - Tuned Ollama runtime (temperature, top_p, top_k, num_predict, stream)
+# - Live draining (no new requests, keep running ones)
+# - Rolling restart per node (zero-downtime)
+# - Auto-drain when node CPU high
+# - Scale-out / scale-in hooks
+# - Tuned Ollama runtime
 ########################################
 
 DOMAINS=("api.aiallplatform.com")
@@ -35,11 +35,10 @@ UPSTREAM_FILE="/etc/nginx/conf.d/ollama-upstream.conf"
 HEALTH_SCRIPT="/usr/local/bin/ollama-cluster-health.sh"
 AUTO_DRAIN_SCRIPT="/usr/local/bin/ollama-auto-drain.sh"
 
-CPU_THRESHOLD=85   # % CPU để auto-drain
+CPU_THRESHOLD=85
 SCALE_OUT_THRESHOLD=90
 SCALE_IN_THRESHOLD=30
 
-# Ollama runtime tuning
 OLLAMA_TEMPERATURE=0.7
 OLLAMA_TOP_P=1.0
 OLLAMA_TOP_K=40
@@ -209,7 +208,7 @@ undrain_backend() {
 }
 
 ########################################
-# Rolling restart từng node (zero-downtime)
+# Rolling restart (zero-downtime)
 ########################################
 
 rolling_restart() {
@@ -220,9 +219,7 @@ rolling_restart() {
 
   for BE in "${BACKENDS[@]}"; do
     local HOST
-    local PORT
     HOST="${BE%%:*}"
-    PORT="${BE##*:}"
 
     log "Rolling restart backend: $BE"
 
@@ -433,6 +430,11 @@ issue_ssl_for_domain() {
   local DOMAIN="$1"
   log "Requesting SSL certificate (standalone) for $DOMAIN..."
 
+  if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+    log "SSL for $DOMAIN already exists → reusing existing certificate."
+    return
+  fi
+
   if systemctl is-active --quiet nginx; then
     log "Stopping nginx temporarily for standalone Certbot..."
     run "systemctl stop nginx"
@@ -580,8 +582,15 @@ EOF
 }
 
 reload_nginx() {
-  run "nginx -t"
-  run "nginx -s reload"
+  log "Testing Nginx config..."
+  if nginx -t; then
+    log "Nginx config OK → reloading..."
+    if ! nginx -s reload; then
+      log "WARN: nginx -s reload failed (but config is valid). Check runtime conflicts or ports."
+    fi
+  else
+    log "ERROR: Nginx config invalid. Not reloading."
+  fi
 }
 
 ########################################
