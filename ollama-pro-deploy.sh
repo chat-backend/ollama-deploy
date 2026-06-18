@@ -11,11 +11,11 @@
 # - Zero-downtime: only nginx reload (no restart)
 # - Project config: API_KEY + TOKEN_SECRET + BASE_LINK (config v0.7)
 # - Hot-swap node (add/remove backend at runtime)
-# - Live draining (no new requests, keep running ones)
-# - Rolling restart per node (zero-downtime)
-# - Auto-drain when node CPU high
-# - Scale-out / scale-in hooks
-# - Tuned Ollama runtime
+# - Live draining (ngừng nhận request mới, giữ kết nối đang chạy)
+# - Rolling restart từng node (zero-downtime)
+# - Auto-drain khi node load cao (CPU)
+# - Hooks scale-out / scale-in (tùy hạ tầng)
+# - Tuned Ollama runtime (temperature, top_p, top_k, num_predict, stream)
 ########################################
 
 DOMAINS=("api.aiallplatform.com")
@@ -35,10 +35,11 @@ UPSTREAM_FILE="/etc/nginx/conf.d/ollama-upstream.conf"
 HEALTH_SCRIPT="/usr/local/bin/ollama-cluster-health.sh"
 AUTO_DRAIN_SCRIPT="/usr/local/bin/ollama-auto-drain.sh"
 
-CPU_THRESHOLD=85
+CPU_THRESHOLD=85   # % CPU để auto-drain
 SCALE_OUT_THRESHOLD=90
 SCALE_IN_THRESHOLD=30
 
+# Ollama runtime tuning
 OLLAMA_TEMPERATURE=0.7
 OLLAMA_TOP_P=1.0
 OLLAMA_TOP_K=40
@@ -208,7 +209,7 @@ undrain_backend() {
 }
 
 ########################################
-# Rolling restart (zero-downtime)
+# Rolling restart từng node (zero-downtime)
 ########################################
 
 rolling_restart() {
@@ -219,7 +220,9 @@ rolling_restart() {
 
   for BE in "${BACKENDS[@]}"; do
     local HOST
+    local PORT
     HOST="${BE%%:*}"
+    PORT="${BE##*:}"
 
     log "Rolling restart backend: $BE"
 
@@ -256,14 +259,20 @@ rolling_restart() {
 ########################################
 
 setup_auto_drain_script() {
-  log "Setting up auto-drain script..."
+  log "Setting up auto-drain script (V12)..."
 
   cat <<'EOF' >"/usr/local/bin/ollama-auto-drain.sh"
 #!/bin/bash
 
 LOG_FILE="/var/log/ollama-auto-drain.log"
 BACKENDS_CONFIG="/etc/ollama/backends.conf"
-CPU_THRESHOLD=85
+DRAIN_CONFIG="/etc/ollama/backends.drain"
+CPU_DRAIN_THRESHOLD=85
+CPU_UNDRAIN_THRESHOLD=60
+STATE_DIR="/var/lib/ollama-auto-drain"
+SCRIPT_PATH="/usr/local/bin/ollama-pro-deploy.sh"
+
+mkdir -p "$STATE_DIR"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -276,27 +285,108 @@ fi
 
 mapfile -t BACKENDS <"$BACKENDS_CONFIG"
 
+DRAIN_BACKENDS=()
+if [ -f "$DRAIN_CONFIG" ]; then
+  mapfile -t DRAIN_BACKENDS <"$DRAIN_CONFIG"
+fi
+
+is_draining() {
+  local BE="$1"
+  for d in "${DRAIN_BACKENDS[@]}"; do
+    if [ "$d" = "$BE" ]; then return 0; fi
+  done
+  return 1
+}
+
 for BE in "${BACKENDS[@]}"; do
   HOST="${BE%%:*}"
-
   METRICS_URL="http://$HOST:9100/metrics"
+  HEALTH_URL="http://$BE/api/health"
+  STATE_FILE="$STATE_DIR/cpu_$HOST.state"
 
-  CPU_USAGE=$(curl -fsS "$METRICS_URL" 2>/dev/null | \
-    awk '/node_cpu_seconds_total{.*mode="idle"/ {idle=$3} END {if (idle>0) print 100-idle}' | head -n1)
+  # Nếu chỉ có 1 backend → không bao giờ drain
+  if [ ${#BACKENDS[@]} -eq 1 ]; then
+    log "Single-backend mode → skipping drain logic"
+    exit 0
+  fi
 
-  if [ -z "$CPU_USAGE" ]; then
-    log "Cannot read CPU metrics for $BE (approx method)"
+  # Kiểm tra backend sống hay chết
+  if ! curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null; then
+    log "Backend $BE is UNHEALTHY → draining"
+    $SCRIPT_PATH --drain-backend "$BE"
     continue
   fi
 
-  CPU_INT=${CPU_USAGE%.*}
-
-  log "Backend $BE CPU≈${CPU_INT}%"
-
-  if [ "$CPU_INT" -ge "$CPU_THRESHOLD" ]; then
-    log "High load on $BE (CPU≈${CPU_INT}%) → drain backend"
-    /usr/local/bin/ollama-pro-deploy.sh --drain-backend "$BE"
+  # Kiểm tra Node Exporter
+  if ! curl -fsS --max-time 2 "$METRICS_URL" >/dev/null; then
+    log "Node Exporter unreachable for $BE → draining"
+    $SCRIPT_PATH --drain-backend "$BE"
+    continue
   fi
+
+  # Lấy snapshot CPU
+  CURRENT_SNAPSHOT=$(curl -fsS --max-time 3 "$METRICS_URL" | \
+    awk '
+      /node_cpu_seconds_total{.*mode="idle"/ { idle += $3 }
+      /node_cpu_seconds_total{.*mode!="idle"/ { busy += $3 }
+      END { print idle" "busy }
+    ')
+
+
+  CURRENT_IDLE=$(echo "$CURRENT_SNAPSHOT" | awk '{print $1}')
+  CURRENT_BUSY=$(echo "$CURRENT_SNAPSHOT" | awk '{print $2}')
+
+  if [ -z "$CURRENT_IDLE" ] || [ -z "$CURRENT_BUSY" ]; then
+    log "Cannot read CPU metrics for $BE"
+    continue
+  fi
+
+  # Lần đầu → lưu state
+  if [ ! -f "$STATE_FILE" ]; then
+    echo "$CURRENT_IDLE $CURRENT_BUSY" >"$STATE_FILE"
+    log "Init CPU state for $BE → waiting next cycle"
+    continue
+  fi
+
+  read -r PREV_IDLE PREV_BUSY <"$STATE_FILE"
+
+  DELTA_IDLE=$(awk -v c="$CURRENT_IDLE" -v p="$PREV_IDLE" 'BEGIN {print c-p}')
+  DELTA_BUSY=$(awk -v c="$CURRENT_BUSY" -v p="$PREV_BUSY" 'BEGIN {print c-p}')
+  DELTA_TOTAL=$(awk -v i="$DELTA_IDLE" -v b="$DELTA_BUSY" 'BEGIN {print i+b}')
+
+  if (( $(echo "$DELTA_TOTAL <= 0" | bc -l) )); then
+    echo "$CURRENT_IDLE $CURRENT_BUSY" >"$STATE_FILE"
+    continue
+  fi
+
+  CPU_PERCENT=$(awk -v busy="$DELTA_BUSY" -v total="$DELTA_TOTAL" \
+    'BEGIN {printf "%.0f", (busy/total)*100}')
+
+  log "Backend $BE CPU≈${CPU_PERCENT}% (delta-based)"
+
+  echo "$CURRENT_IDLE $CURRENT_BUSY" >"$STATE_FILE"
+
+  # Drain logic
+  if [ "$CPU_PERCENT" -ge "$CPU_DRAIN_THRESHOLD" ]; then
+    if ! is_draining "$BE"; then
+      log "High load → draining $BE"
+      $SCRIPT_PATH --drain-backend "$BE"
+    else
+      log "$BE already draining"
+    fi
+    continue
+  fi
+
+  # Undrain logic
+  if [ "$CPU_PERCENT" -le "$CPU_UNDRAIN_THRESHOLD" ]; then
+    if is_draining "$BE"; then
+      log "CPU normal → undraining $BE"
+      $SCRIPT_PATH --undrain-backend "$BE"
+    fi
+    continue
+  fi
+
+  log "$BE in mid-range CPU → no change"
 done
 EOF
 
@@ -305,14 +395,6 @@ EOF
   cat <<EOF >/etc/cron.d/ollama-auto-drain
 * * * * * root $AUTO_DRAIN_SCRIPT
 EOF
-}
-
-scale_out_hook() {
-  log "⚠ Cluster overloaded → consider scale-out (add new backend node)."
-}
-
-scale_in_hook() {
-  log "ℹ Cluster underutilized → consider scale-in (remove some backend)."
 }
 
 ########################################
@@ -429,11 +511,6 @@ install_certbot() {
 issue_ssl_for_domain() {
   local DOMAIN="$1"
   log "Requesting SSL certificate (standalone) for $DOMAIN..."
-
-  if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-    log "SSL for $DOMAIN already exists → reusing existing certificate."
-    return
-  fi
 
   if systemctl is-active --quiet nginx; then
     log "Stopping nginx temporarily for standalone Certbot..."
@@ -582,15 +659,8 @@ EOF
 }
 
 reload_nginx() {
-  log "Testing Nginx config..."
-  if nginx -t; then
-    log "Nginx config OK → reloading..."
-    if ! nginx -s reload; then
-      log "WARN: nginx -s reload failed (but config is valid). Check runtime conflicts or ports."
-    fi
-  else
-    log "ERROR: Nginx config invalid. Not reloading."
-  fi
+  run "nginx -t"
+  run "nginx -s reload"
 }
 
 ########################################
