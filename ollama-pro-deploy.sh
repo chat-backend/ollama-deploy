@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ########################################
-# PRO+ Ollama Deploy Script (Version 14)
+# PRO+ Ollama Deploy Script (Version 15)
 # - Multi-domain
 # - Auto-update mode
 # - Auto SSL renew
@@ -16,6 +16,7 @@
 # - Auto-drain khi node load cao (CPU) — V12
 # - Auto-scale hooks (scale-out / scale-in) — V13
 # - Auto-heal backend (drain + restart local) — V14
+# - V15: Đồng bộ Nginx / upstream / health / auto-drain / auto-heal
 ########################################
 
 DOMAINS=("api.aiallplatform.com")
@@ -254,7 +255,7 @@ rolling_restart() {
 }
 
 ########################################
-# Auto-drain & scale hooks (V12 + V13)
+# Auto-drain & auto-scale script (V15)
 ########################################
 
 setup_auto_drain_script() {
@@ -645,12 +646,14 @@ server {
 
     client_max_body_size 50M;
 
+    # Security headers
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
 
+    # CORS
     add_header Access-Control-Allow-Origin * always;
     add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
     add_header Access-Control-Allow-Headers "Authorization, Content-Type, x-api-key" always;
@@ -659,6 +662,12 @@ server {
         return 204;
     }
 
+    # Chặn mọi request không phải /ollama
+    location / {
+        return 404;
+    }
+
+    # Health check
     location = /ollama/api/health {
         proxy_pass http://ollama_cluster/api/health;
         proxy_http_version 1.1;
@@ -671,9 +680,13 @@ server {
         proxy_read_timeout 60;
         proxy_send_timeout 60;
         proxy_buffering off;
+        proxy_request_buffering off;
     }
 
-    location /ollama {
+    # MAIN OLLAMA API
+    location /ollama/ {
+
+        # API KEY CHECK
         if (\$http_x_api_key = "") {
             return 401;
         }
@@ -682,7 +695,7 @@ server {
             return 403;
         }
 
-        proxy_pass http://ollama_cluster;
+        proxy_pass http://ollama_cluster/;
         proxy_http_version 1.1;
 
         proxy_set_header Host \$host;
@@ -693,6 +706,7 @@ server {
         proxy_read_timeout 3600;
         proxy_send_timeout 3600;
         proxy_buffering off;
+        proxy_request_buffering off;
     }
 }
 EOF
@@ -975,7 +989,7 @@ EOF
 }
 
 ########################################
-# V13: Auto-scale hooks
+# V13: Auto-scale hooks (manual triggers)
 ########################################
 
 scale_out_hook() {
@@ -1105,7 +1119,7 @@ main() {
       ;;
   esac
 
-  log "🚀 Starting PRO+ Ollama deployment (V14) for domains: ${DOMAINS[*]}"
+  log "🚀 Starting PRO+ Ollama deployment (V15) for domains: ${DOMAINS[*]}"
 
   init_project_config
   load_backends
@@ -1157,8 +1171,8 @@ main() {
   log "    OLLAMA_URL_ONLINE=$BASE_LINK"
   log "    x-api-key: $API_KEY"
 
-  log "✔ Deployment completed (V14)."
-  log "ℹ Auto-scale hooks are available but NOT triggered automatically after deploy."
+  log "✔ Deployment completed (V15)."
+  log "ℹ Auto-scale & auto-drain are active via cron; manual hooks still available."
 }
 
 main "$@"
